@@ -1,47 +1,40 @@
-# title
+# TriM-DTA
 
-TriM-DTA: A tri-modal fusion framework for drug–target binding affinity prediction
+TriM-DTA is a tri-modal framework for drug--target affinity prediction. It combines molecular and protein sequence representations with topological and geometric graph features.
 
-## overview
+## Setup
 
-![overview](fig/legend.png)
-
-## abstract
-
-Predicting drug–target binding affinity is a crucial problem in computational drug discovery, requiring accurate modeling of diverse molecular representations. Existing approaches often rely on a single modality, such as sequence, graph, or structure, they have limitations in capturing the complementary biochemical and spatial cues behind molecular interactions. In this work, we propose TriM-DTA, a tri-modal information fusion framework to accurate predict drug-target binding affinity that integrates sequence features, topological graphs, and geometric structures of both drugs and targets. This framework consists of modality-specific encoders and a cross-modal attention fusion module that jointly learns affinity-aware representations by aligning structural and sequence information. We evaluate TriM-DTA on two benchmark datasets under both seen and unseen scenarios, where it consistently outperforms state-of-the
-art methods in predictive accuracy and generalization. Ablation studies confirm the distinct contribution of each modality to overall performance. Furthermore, embedding space analysis reveals that the model organizes molecular representations into well-separated clusters aligned with binding strength. Atomic level visualization highlights chemically meaningful substructures at protein–ligand interfaces, supporting the interpretability and biological plausibility of TriM-DTA. These results demonstrate that tri-modal fusion provides a unified and expressive view of drug-target binding affinity prediction. TriM-DTA offers a flexible and extensible foundation for structure-aware molecular modeling and holds promise in binding pose prediction, selectivity estimation, and mechanism-driven drug design. 
-
-### install
+Use Python 3.8+ with a CUDA-enabled PyTorch installation, then install the remaining packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### dataset
+The code expects the following local resources, which are intentionally not tracked in this repository: `davis/` or `kiba/` data splits and processed CSVs, `target_contact_map_<dataset>/` contact maps, `Vocab/` vocabulary pickles, and PyG structure graphs (for example `davis/pyg_8/`). Generate structure graphs from PDB/SDF inputs with helpers in `process.py`.
 
-coming soon
+## Train
 
-### quickly start
-
+The default training entry point uses the Davis dataset and CUDA device 0:
 
 ```bash
-python main.py
+python main.py --dim 128 --epoch 100 --batch_size 100 --lr 1e-4
 ```
 
-## file
+For the reproducible KIBA scaling experiment:
 
-```
-.
-├── config.py
-├── egnn.py
-├── main.py
-├── model.py
-├── utils.py
-└── __pycache__/
+```bash
+python trim_dta_experiment.py --dataset kiba --mode default --dim 128
 ```
 
-## cite
-```
-coming soon
-```
+`scripts/run.sh` contains example Davis hyperparameter runs, and `scripts/run_kiba_scalability.sh` runs the KIBA scale sweep.
 
+## Repository layout
+
+- `main.py`: TriM-DTA model definition and training loop.
+- `dataset.py`, `model.py`, `egnn.py`, `moe.py`: data and model components.
+- `process.py`: PDB/SDF to PyTorch Geometric preprocessing helpers.
+- `trim_dta_experiment.py`: KIBA experiment with timing and memory reporting.
+
+## Citation
+
+Citation information will be added with the accompanying manuscript.

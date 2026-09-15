@@ -88,7 +88,7 @@ class DTADataset(InMemoryDataset):
                         protein_lengths=protein_lengths,
                         seq = seq
                         )
-          
+
             ta_g = DATA(edge_index=torch.LongTensor(ta_g).transpose(1, 0),
                         )
             self.data.append((Data, ta_g))
@@ -113,12 +113,23 @@ class DTADataset(InMemoryDataset):
         return self.data[idx]
 
 class DTA_Dataset(InMemoryDataset):
-    def __init__(self, root, path, smiles_emb, target_emb, smiles_idx, smiles_graph, target_graph, smiles_len, target_len,mode):
+    def __init__(self, root, path, smiles_emb, target_emb, smiles_idx, smiles_graph, target_graph, smiles_len, target_len,mode, graph_dir=None, row_indices=None):
 
         super(DTA_Dataset, self).__init__(root)
         self.path = path
         df = pd.read_csv(path)
+        if row_indices is not None:
+            # Preserve caller-provided order (used for deterministic nested
+            # subsets), then reset because process accesses rows by position.
+            df = df.iloc[row_indices].reset_index(drop=True)
         self.mode = mode
+        # Precomputed 3-D graphs are dataset-specific.  Keeping this explicit
+        # avoids silently assuming the Davis ``pyg_8`` layout for KIBA.
+        self.graph_dir = graph_dir or f'./{mode}/pyg_8'
+        # A KIBA split reuses the same protein and compound structures across
+        # many interactions. Cache immutable, precomputed PyG objects within
+        # this dataset rather than deserializing a duplicate for every row.
+        self._graph_cache = {}
         self.data = []
         sm_id = pd.read_csv("kiba/sm_id.csv")
         self.sm_id = {sm_id.loc[i, 'smiles']: sm_id.loc[i, 'id'] for i in range(len(sm_id))}
@@ -156,8 +167,16 @@ class DTA_Dataset(InMemoryDataset):
             df['id'] = df['target_key']
         # drug_emb = np.load(f'./{data}/{self.mode}/drug.npz',allow_pickle=True)
         # protein_emb = np.load(f'./{data}/{self.mode}/protein.npz', allow_pickle=True)
-        # drug_emb = {sm: torch.tensor(emb) for sm, emb in drug_emb.items()}
-        # protein_emb = {target: torch.tensor(emb) for target, emb in protein_emb.items()}
+        drug_path = f'./{data}/default/drug.npz'
+        protein_path = f'./{data}/default/protein.npz'
+        # ``Data.x`` is legacy combined-graph input and is not consumed by
+        # TriM-DTA/DMFF. Some released KIBA packages do not include these two
+        # unused archives, so do not make the active three-branch model depend
+        # on them merely to construct a dataset.
+        has_legacy_embeddings = os.path.exists(drug_path) and os.path.exists(protein_path)
+        if has_legacy_embeddings:
+            drug_emb = {sm: torch.tensor(emb) for sm, emb in np.load(drug_path, allow_pickle=True).items()}
+            protein_emb = {target: torch.tensor(emb) for target, emb in np.load(protein_path, allow_pickle=True).items()}
         for i in tqdm(range(len(df))):
             sm = df.loc[i, 'compound_iso_smiles']
             target = df.loc[i, 'target_key']
@@ -199,15 +218,21 @@ class DTA_Dataset(InMemoryDataset):
                         protein_lengths=protein_lengths,
                         )
 
-#             bs = (protein_emb[target][0].unsqueeze(0)+drug_emb[sm][0].unsqueeze(0))/2
-#             bs = F.pad(bs, (0,1), 'constant', 2)
-#             ts = F.pad(protein_emb[target], (0, 1), 'constant', 0)
-#             ss = F.pad(drug_emb[sm], (0,1), 'constant', 1)
-
-#             Data.x = torch.cat((ts, ss, bs), dim=0)
-            t_data = torch.load(f'./{data}/pyg/{id}.pt')
-            # s_data = torch.load(f'./{data}/pyg/{sm}.pt')
-            s_data = torch.load(f'./{data}/pyg/{self.sm_id[sm]}.pt')
+            if has_legacy_embeddings:
+                bs = (protein_emb[target][0].unsqueeze(0)+drug_emb[sm][0].unsqueeze(0))/2
+                bs = F.pad(bs, (0,1), 'constant', 2)
+                ts = F.pad(protein_emb[target], (0, 1), 'constant', 0)
+                ss = F.pad(drug_emb[sm], (0,1), 'constant', 1)
+                Data.x = torch.cat((ts, ss, bs), dim=0)
+            target_graph_path = os.path.join(self.graph_dir, f'{id}.pt')
+            sm_graph_name = sm if data == 'davis' else str(self.sm_id[sm])
+            smiles_graph_path = os.path.join(self.graph_dir, f'{sm_graph_name}.pt')
+            if target_graph_path not in self._graph_cache:
+                self._graph_cache[target_graph_path] = torch.load(target_graph_path)
+            if smiles_graph_path not in self._graph_cache:
+                self._graph_cache[smiles_graph_path] = torch.load(smiles_graph_path)
+            t_data = self._graph_cache[target_graph_path]
+            s_data = self._graph_cache[smiles_graph_path]
             Data = (Data, s_data, t_data)
             self.data.append(Data)
         if self.pre_filter is not None:

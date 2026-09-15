@@ -6,6 +6,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 import  pandas as pd
+from torch_geometric.data import Data
 class ProteinEGNNDataset(Dataset):
     def __init__(self, pdb_folder, seq_len=1000, edge_threshold=8.0):
         self.pdb_folder = pdb_folder
@@ -151,16 +152,16 @@ def pdb_to_pyg():
             features, coords, edge_index, edge_attr= pdb_to_pyg(pdb_path, distance_threshold)
 
             # Create a PyTorch Geometric Data object
-            data = DATA(x=features, pos=coords, edge_index=edge_index, edge_attr=edge_attr)
+            data = Data(x=features, pos=coords, edge_index=edge_index, edge_attr=edge_attr)
 
             # Save the Data object to the output folder
             output_path = os.path.join(output_folder, f"{os.path.splitext(pdb_file)[0]}.pt")
             torch.save(data, output_path)
 
-    input_folder = 'kiba/pdb'
-    output_folder = 'kiba/pyg'
+    input_folder = 'davis/pdb'
+    output_folder = 'davis/pyg_9'
 
-    process_pdb_folder(input_folder, output_folder, distance_threshold=8.0)
+    process_pdb_folder(input_folder, output_folder, distance_threshold=9.0)
 def sm_to_sdf():
     # 读取 DataFrame
     df = pd.read_csv('kiba/kiba_processed.csv')  # 假设数据是从 CSV 读取的，修改为实际路径
@@ -176,7 +177,7 @@ def sm_to_sdf():
         sm_id.loc[i] = [row,i]
     sm_id.to_csv('kiba/sm_id.csv',index=False)
 
-        
+
 
     # # 遍历 DataFrame 的 compound_iso_smiles 列
     # for idx in range(len(df)):
@@ -205,11 +206,11 @@ def sdf_to_pyg():
     import torch
     from rdkit import Chem
     from rdkit.Chem import AllChem
-    from torch_geometric.data import Data
+
     import numpy as np
     # 设置文件夹路径
-    input_dir = 'kiba/sdf/'  # SDF 文件夹路径
-    output_dir = 'kiba/pyg/'  # 输出目录
+    input_dir = 'davis/sdf/'  # SDF 文件夹路径
+    output_dir = 'davis/pyg_9/'  # 输出目录
 
     # 定义常见原子类型
     COMMON_ATOMIC_TYPES = [
@@ -218,7 +219,7 @@ def sdf_to_pyg():
         'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn'
     ]
     atomic_type_to_index = {atom: idx for idx, atom in enumerate(COMMON_ATOMIC_TYPES)}
-    
+
     def one_hot(index, length):
         vec = torch.zeros(length)
         if 0 <= index < length:
@@ -293,5 +294,9 @@ if __name__ == '__main__':
     # dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
     sdf_to_pyg()
     # sm_to_sdf()
+
+
+
+
 
     pdb_to_pyg()

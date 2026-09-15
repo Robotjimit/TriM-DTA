@@ -22,8 +22,11 @@ from torch_geometric.nn import (
                                 LayerNorm,
                                 global_add_pool,
                                 Set2Set,
+                                SAGEConv,
                                 GCNConv,
+                                NNConv,
                                 )
+
 #############################
 class AttnConvBlock(nn.Module):
     def __init__(self, dim, heads=4, kernel_size=5, dropout=0.1):
@@ -66,7 +69,7 @@ class SpatialGroupEnhance_for_1D(nn.Module):
         self.weight   = Parameter(torch.zeros(1, groups, 1))
         self.bias     = Parameter(torch.ones(1, groups, 1))
         self.sig      = nn.Sigmoid()
-    
+
     def forward(self, x): # (b, c, h)
         b, c, h = x.size()
         x = x.reshape(b * self.groups, -1, h)
@@ -100,7 +103,7 @@ class LinkAttention(nn.Module):
         out = torch.matmul(a, value) # (B,heads,seq_len) * (B,seq_len,hidden_dim) = (B,heads,hidden_dim)
         out = torch.mean(out, dim=1).squeeze() # (B,hidden_dim)
         return out, a
-    
+
 class GINConvNet(torch.nn.Module):
     def __init__(self, n_output=1, num_features_xd=128, num_features_xt=25,
                  n_filters=32, embed_dim=128, output_dim=128, dropout=0.2):
@@ -315,7 +318,7 @@ class MultiLayerGCN(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        
+
         for i in range(self.num_layers - 1):
             x = self.convs[i](x, edge_index)  # 图卷积
             x = F.relu(x)  # 激活函数
@@ -326,61 +329,74 @@ class MultiLayerGCN(torch.nn.Module):
         x = F.softmax(x, dim=1)
         return x  # 使用 log_softmax 作为输出
 
-import torch.nn.functional as F
+class MultiLayerGAT(torch.nn.Module):
+    def __init__(self, num_features, hidden_dim, num_classes, num_layers, heads=4):
+        super(MultiLayerGAT, self).__init__()
+        self.num_layers = num_layers
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(GATConv(num_features, hidden_dim, heads=heads))  # 第一层
+        for _ in range(1, num_layers - 1):
+            self.convs.append(GATConv(hidden_dim * heads, hidden_dim, heads=heads))  # 中间层
+        self.convs.append(GATConv(hidden_dim * heads, num_classes, heads=1))  # 最后一层
 
-class LMF(nn.Module):
-    def __init__(self, dim, rank=4, dropout=0.1):
-        """
-        dim: 输入/输出的特征维度 D
-        rank: LMF中的秩 r，控制融合能力与复杂度
-        dropout: 融合后的dropout概率
-        """
-        super(LMF, self).__init__()
-        self.rank = rank
-        self.dim = dim
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
 
-        # 每个模态的低秩张量因子 [r, D+1, D]
-        self.factor1 = nn.Parameter(torch.Tensor(rank, dim + 1, dim))
-        self.factor2 = nn.Parameter(torch.Tensor(rank, dim + 1, dim))
-        self.factor3 = nn.Parameter(torch.Tensor(rank, dim + 1, dim))
+        for i in range(self.num_layers - 1):
+            x = self.convs[i](x, edge_index)  # 图注意力卷积
+            x = F.elu(x)  # 激活函数
+            x = F.dropout(x, training=self.training)  # Dropout
 
-        # 融合加权系数 [1, r] 和偏置 [1, D]
-        self.fusion_weights = nn.Parameter(torch.Tensor(1, rank))
-        self.fusion_bias = nn.Parameter(torch.Tensor(1, dim))
+        x = self.convs[-1](x, edge_index)  # 最后一层卷积
+        x = global_mean_pool(x, data.batch)
+        x = F.softmax(x, dim=1)
+        return x
 
-        self.dropout = nn.Dropout(dropout)
-        self._init_weights()
+class MultiLayerSAGEConv(torch.nn.Module):
+    def __init__(self, num_features, hidden_dim, num_classes, num_layers):
+        super(MultiLayerSAGEConv, self).__init__()
+        self.num_layers = num_layers
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(SAGEConv(num_features, hidden_dim))  # 第一层
+        for _ in range(1, num_layers - 1):
+            self.convs.append(SAGEConv(hidden_dim, hidden_dim))  # 中间层
+        self.convs.append(SAGEConv(hidden_dim, num_classes))  # 最后一层
 
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.factor1)
-        nn.init.xavier_uniform_(self.factor2)
-        nn.init.xavier_uniform_(self.factor3)
-        nn.init.xavier_uniform_(self.fusion_weights)
-        nn.init.zeros_(self.fusion_bias)
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
 
-    def forward(self, x1, x2, x3):
-        """
-        x1, x2, x3: [B, D]
-        return: [B, D]
-        """
-        B = x1.size(0)
-        device = x1.device
-        dtype = x1.dtype
+        for i in range(self.num_layers - 1):
+            x = self.convs[i](x, edge_index)  # GraphSAGE 卷积
+            x = F.relu(x)  # 激活函数
+            x = F.dropout(x, training=self.training)  # Dropout
 
-        # Add bias term → [B, D+1]
-        x1_ = torch.cat([torch.ones(B, 1, device=device, dtype=dtype), x1], dim=1)
-        x2_ = torch.cat([torch.ones(B, 1, device=device, dtype=dtype), x2], dim=1)
-        x3_ = torch.cat([torch.ones(B, 1, device=device, dtype=dtype), x3], dim=1)
+        x = self.convs[-1](x, edge_index)  # 最后一层卷积
+        x = global_mean_pool(x, data.batch)
+        x = F.softmax(x, dim=1)
+        return x
 
-        # 低秩投影：[B, r, D]
-        proj1 = torch.einsum('bd, rdk -> brk', x1_, self.factor1)
-        proj2 = torch.einsum('bd, rdk -> brk', x2_, self.factor2)
-        proj3 = torch.einsum('bd, rdk -> brk', x3_, self.factor3)
+class MultiLayerGIN(torch.nn.Module):
+    def __init__(self, num_features, hidden_dim, num_classes, num_layers):
+        super(MultiLayerGIN, self).__init__()
+        self.num_layers = num_layers
+        self.convs = torch.nn.ModuleList()
+        nn1 = Sequential(Linear(num_features, hidden_dim), ReLU(), Linear(hidden_dim, hidden_dim))
+        self.convs.append(GINConv(nn1))  # 第一层
+        for _ in range(1, num_layers - 1):
+            nn_i = Sequential(Linear(hidden_dim, hidden_dim), ReLU(), Linear(hidden_dim, hidden_dim))
+            self.convs.append(GINConv(nn_i))  # 中间层
+        nn_last = Sequential(Linear(hidden_dim, hidden_dim), ReLU(), Linear(hidden_dim, num_classes))
+        self.convs.append(GINConv(nn_last))  # 最后一层
 
-        # 融合：[B, r, D]
-        fused = proj1 * proj2 * proj3  # element-wise multiplication
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
 
-        # 加权求和 rank 维度：[B, D]
-        out = torch.einsum('br, brd -> bd', self.fusion_weights.expand(B, -1), fused) + self.fusion_bias
-        out = self.dropout(out)
-        return out
+        for i in range(self.num_layers - 1):
+            x = self.convs[i](x, edge_index)  # GIN 卷积
+            x = F.relu(x)  # 激活函数
+            x = F.dropout(x, training=self.training)  # Dropout
+
+        x = self.convs[-1](x, edge_index)  # 最后一层卷积
+        x = global_mean_pool(x, data.batch)
+        x = F.softmax(x, dim=1)
+        return x

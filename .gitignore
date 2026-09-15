@@ -1,0 +1,23 @@
+# Python cache and notebook checkpoints
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Experiment outputs and large generated artifacts
+Model/
+results/
+*.pt
+*.pth
+*.ckpt
+*.log
+
+# Local datasets, structures, and preprocessing artifacts
+davis/
+kiba/
+Vocab/
+target_contact_map_*/
+*.zip
+*.npz
+*.npy
+*.pdb
+*.sdf

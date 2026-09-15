@@ -7,12 +7,13 @@ import networkx as nx
 
 import torch
 import os
+import argparse
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
 from build_vocab import WordVocab
 from utils import *
 import gc
-from dataset import DTA_Dataset
+from dataset import DTADataset,DTA_Dataset
 from sklearn.model_selection import KFold
 from model import *
 from torch import nn as nn
@@ -25,10 +26,10 @@ from lifelines.utils import concordance_index
 
 CUDA = '0'
 device = torch.device('cuda:' + CUDA)
-LR = 1e-3
-NUM_EPOCHS = 100
+
+
 seed = 0
-batch_size = 128
+
 dataset_name = 'davis'
 
 
@@ -97,7 +98,11 @@ class DMFF(nn.Module):
         self.sgemb = nn.Linear(31, embedding_dim)
         self.tgemb = nn.Linear(21, embedding_dim)
         self.MGNN = MultiLayerGCN(num_features=embedding_dim, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
-        self.M_GNN = MultiLayerGCN(num_features=embedding_dim+1, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
+        # self.MGNN = MultiLayerSAGPool(num_features=embedding_dim, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
+        # self.MGNN = MultiLayerSAGEConv(num_features=embedding_dim, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
+        # self.MGNN = MultiLayerGIN(num_features=embedding_dim, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
+        # self.MGNN = MultiLayerGAT(num_features=embedding_dim, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
+        # self.M_GNN = MultiLayerGCN(num_features=embedding_dim+1, hidden_dim=embedding_dim//2, num_classes=embedding_dim, num_layers=3)
         self.out_2g_fc1 = nn.Linear(hidden_dim*2, 256 * 8)
         self.out_2g_fc2 = nn.Linear(256 * 8, hidden_dim)
 
@@ -105,13 +110,26 @@ class DMFF(nn.Module):
         self.sEGNN = EGNN(31,128,embedding_dim//2)
         self.out_3g_fc1 = nn.Linear(hidden_dim, 256 * 8)
         self.out_3g_fc2 = nn.Linear(256 * 8, hidden_dim)
-        # self.crossattn = CrossAttentionMultiHead(hidden_dim, 2)
-        self.lmf = LMF(dim=hidden_dim, rank=4, dropout=0.1)
-        # self.w = nn.Parameter(torch.tensor(0.5))
+        self.crossattn = CrossAttentionMultiHead(hidden_dim, 2)
+        self.w = nn.Parameter(torch.tensor(0.5))
 
         self.fusion_0 = nn.Linear(embedding_dim*2, embedding_dim)
-        self.fusion_1 = nn.Linear(embedding_dim, embedding_dim *4)
+        self.fusion_1 = nn.Linear(embedding_dim *3, embedding_dim *4)
         self.fusion_2 = nn.Linear(embedding_dim *4, embedding_dim)
+        self.gate_fusion = nn.Linear(embedding_dim * 3, 3)
+        # self.modality_ffn = nn.Sequential(
+        #     nn.Linear(embedding_dim, embedding_dim),
+        #     nn.ReLU(),
+        #     nn.Dropout(dropout_rate),
+        # )
+        # self.modality_score = nn.Linear(embedding_dim, 1)
+        self.modality_attn = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=2,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+        self.modality_pool = nn.Linear(embedding_dim, 1)
         self.ln= nn.LayerNorm(embedding_dim)
 
     def forward(self, data, reset=False):
@@ -122,15 +140,15 @@ class DMFF(nn.Module):
         :param reset: 是否重置状态
         :return: 模型输出和标签
         """
-        
-        s_data, t_data = data
-        batch_size = len(t_data)
-        smiles = t_data.smiles.to(device)
-        protein = t_data.protein.to(device)
+
+        data, s_data, t_data = data
+        batch_size = len(data)
+        smiles = data.smiles.to(device)
+        protein = data.protein.to(device)
         smiles = smiles.view(batch_size,540)
         protein = protein.view(batch_size,1000)
-        smiles_lengths = t_data.smiles_lengths
-        protein_lengths = t_data.protein_lengths
+        smiles_lengths = data.smiles_lengths
+        protein_lengths = data.protein_lengths
 
         # SMILES 处理
         smiles = self.smiles_embed(smiles)
@@ -169,11 +187,11 @@ class DMFF(nn.Module):
         pwff = self.dropout(self.relu(self.pwff_1(out)))
         pwff = self.dropout(self.relu(self.pwff_2(pwff)))
         out = pwff + out
-        
+
         out = self.dropout(self.relu(self.out_fc1(out)))
         out = self.dropout(self.relu(self.out_fc2(out)))
         # out = self.bn(out)
-        
+
         s3g = self.sEGNN(s_data.x,s_data.pos,s_data.edge_index,s_data.batch)
         t3g = self.tEGNN(t_data.x,t_data.pos,t_data.edge_index,t_data.batch)
         out3g = torch.cat([s3g,t3g],dim=-1)
@@ -192,17 +210,36 @@ class DMFF(nn.Module):
         out2g = self.dropout(self.relu(self.out_2g_fc2(pwff)))
         out2g = self.ln(out2g)
 
-        # outg = self.w * out2g + (1 - self.w) * out3g
-        # # out_ = out
-        # out_ = self.crossattn(outg,out,out)
-        out_ = self.lmf(out,out2g,out3g)
-        # out_ = torch.cat([out,outg],dim=-1)
-        # out_ = self.fusion_0(out_)
-        # out_ = self.ln(out_)
-        out_ = self.fusion_1(out_)
-        out_ = self.fusion_2(out_)
-        out = out_ + out
-        return self.out_fc3(out).squeeze(), t_data.y
+        # out_ = (out + out2g + out3g)/3
+
+#         outg = self.w * out2g + (1 - self.w) * out3g
+#         out_ = self.crossattn(outg,out,out)
+        # out = out_ + out
+
+        # fusion_input = torch.cat([out, out2g, out3g], dim=-1)
+        # gate = torch.softmax(self.gate_fusion(fusion_input), dim=-1)
+        # out_ = (
+        #     gate[:, 0:1] * out
+        #     + gate[:, 1:2] * out2g
+        #     + gate[:, 2:3] * out3g
+        # )
+
+        # out_ = torch.cat([out, out2g, out3g], dim=-1)
+        # out_ = self.fusion_1(out_)
+        # out_ = self.fusion_2(out_)
+
+        # modality_out = self.modality_ffn(out)
+        # modality_out2g = self.modality_ffn(out2g)
+        # modality_out3g = self.modality_ffn(out3g)
+        # modality_tokens = torch.stack([modality_out, modality_out2g, modality_out3g], dim=1)
+        # modality_weight = torch.softmax(self.modality_score(modality_tokens), dim=1)
+        # out = (modality_tokens * modality_weight).sum(dim=1)
+
+        modality_tokens = torch.stack([out, out2g, out3g], dim=1)
+        attn_out, _ = self.modality_attn(modality_tokens, modality_tokens, modality_tokens)
+        out = attn_out.mean(dim=1)
+
+        return self.out_fc3(out).squeeze(), data.y
 
     def generate_masks(self, adj, adj_sizes, n_heads):
         """
@@ -236,15 +273,83 @@ class DMFF(nn.Module):
         lengths = mask.sum(dim=1).clamp(min=1e-6)  # [B, 1]
         return sum_x / lengths  # [B, D]
 
+
+def smiles_to_graph(smile):
+    mol = Chem.MolFromSmiles(smile)
+    c_size = mol.GetNumAtoms()
+
+    edges = []
+    for bond in mol.GetBonds():
+        edges.append([bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()])
+    g = nx.Graph(edges).to_directed()
+    edge_index = []
+    mol_adj = np.zeros((c_size, c_size))
+    for e1, e2 in g.edges:
+        mol_adj[e1, e2] = 1
+    mol_adj += np.matrix(np.eye(mol_adj.shape[0]))
+    index_row, index_col = np.where(mol_adj >= 0.5)
+    for i, j in zip(index_row, index_col):
+        edge_index.append([i, j])
+    edge_index = np.array(edge_index)
+    return c_size, edge_index
+
+
 #############################################################################
 
+
 df = pd.read_csv(f'./{dataset_name}/{dataset_name}_processed.csv')
+
 smiles = set(df['compound_iso_smiles'])
 target = set(df['target_key'])
+
 target_seq = {}
 for i in range(len(df)):
     target_seq[df.loc[i, 'target_key']] = df.loc[i, 'target_sequence']
 
+smiles_graph = {}
+for sm in smiles:
+    _, graph = smiles_to_graph(sm)
+    smiles_graph[sm] = graph
+
+target_uniprot_dict = {}
+target_process_start = {}
+target_process_end = {}
+
+for i in range(len(df)):
+    target = df.loc[i, 'target_key']
+    if dataset_name == 'kiba':
+        uniprot = df.loc[i, 'target_key']
+    else:
+        uniprot = df.loc[i, 'uniprot']
+    target_uniprot_dict[target] = uniprot
+    target_process_start[target] = df.loc[i, 'target_sequence_start']
+    target_process_end[target] = df.loc[i, 'target_sequence_end']
+
+contact_dir = './target_contact_map_' + dataset_name + '/'
+target_graph = {}
+
+
+def target_to_graph(target_key, target_sequence, contact_dir, start, end):
+    target_edge_index = []
+    target_size = len(target_sequence)
+    contact_file = os.path.join(contact_dir, target_key + '.npy')
+    contact_map = np.load(contact_file)
+    contact_map = contact_map[start:end, start:end]
+    index_row, index_col = np.where(contact_map > 0.8)
+
+    for i, j in zip(index_row, index_col):
+        target_edge_index.append([i, j])
+    target_edge_index = np.array(target_edge_index)
+    return target_size, target_edge_index
+
+
+for target in tqdm(target_seq.keys()):
+    uniprot = target_uniprot_dict[target]
+    contact_map = np.load(contact_dir + uniprot + '.npy')
+    start = target_process_start[target]
+    end = target_process_end[target]
+    _, graph = target_to_graph(uniprot, target_seq[target], contact_dir, start, end)
+    target_graph[target] = graph
 
 drug_vocab = WordVocab.load_vocab('./Vocab/smiles_vocab.pkl')
 target_vocab = WordVocab.load_vocab('./Vocab/protein_vocab.pkl')
@@ -317,27 +422,28 @@ for k in target_seq:
 
 
 data_set = f"{dataset_name}_processed"
+# mode = ['warm_start','drug_coldstart','protein_coldstart','all_coldstart']
 mode = ['default', 'drug_cold', 'target_cold', 'all_cold']
 mode_name = mode[0]
-seed = [18,283,839,12,74]
-# model_file_name = './Model/' + dataset_name + '_' + mode_name + '.pt'
-model_file_name = './Model/' + dataset_name + '_LMF.pt'
-dim = 128
-def count_parameters(model):
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return {
-        "Total": total_params/1e6,
-        "Trainable": trainable_params/1e6
-    }
-for fold in range(5):
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dim', type=int, default=64, help='base embedding dimension')
+parser.add_argument('--epoch', type=int, default=100, help='number of training epochs')
+parser.add_argument('--batch_size', type=int, default=100, help='training batch size')
+parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+args = parser.parse_args()
+
+dim = args.dim
+NUM_EPOCHS = args.epoch
+batch_size = args.batch_size
+LR = args.lr
+for fold in range(0,2):
     print("Building model...")
     model = DMFF(embedding_dim=dim * 2, lstm_dim=dim, hidden_dim=dim *2, dropout_rate=0.2,
                  alpha=0.2, n_heads=8, bilstm_layers=2, protein_vocab=26,
                  smile_vocab=45, theta=0.5).to(device)
-    param_stats = count_parameters(model)
-    print(f"Total Params: {param_stats['Total']:,}")
-    print(f"Trainable Params: {param_stats['Trainable']:,}")
+    model_file_name = './Model/' + dataset_name + '_' + mode_name +'_jointattn_' +  '_fold_' + str(fold) + '.pt'
     # load model
     if os.path.exists(model_file_name):
         save_model = torch.load(model_file_name)
@@ -348,20 +454,22 @@ for fold in range(5):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    schedule = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=2e-5,verbose=True)
+    schedule = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5,verbose=True)
 
     best_mse = 1000
     best_test_mse = 1000
     best_epoch = -1
     best_test_epoch = -1
+    patience = 0
     print(f"Fold {fold + 1}")
     log(f'train on {dataset_name}_{mode_name}')
+    log(f'settings: dim={dim}, epoch={NUM_EPOCHS}, batch_size={batch_size}, lr={LR}, fusion=jointattn, fold={fold}')
     for epoch in range(NUM_EPOCHS):
         print("No {} epoch".format(epoch))
         if epoch == 0:
-            train_dataset = DTA_Dataset(root='./', path=f'./{dataset_name}/{mode_name}/'+ 'train.csv', smiles_emb=smiles_emb, target_emb=target_emb, smiles_len=smiles_len, target_len=target_len,mode= mode_name)
-            val_dataset = DTA_Dataset(root='./', path=f'./{dataset_name}/{mode_name}/'+ 'valid.csv', smiles_emb=smiles_emb, target_emb=target_emb, smiles_len=smiles_len, target_len=target_len,mode= mode_name)
-            test_dataset = DTA_Dataset(root='./', path=f'./{dataset_name}/{mode_name}/'+ 'test.csv', smiles_emb=smiles_emb, target_emb=target_emb, smiles_len=smiles_len, target_len=target_len,mode= mode_name)
+            train_dataset = DTA_Dataset(root='./', path=f'./{dataset_name}/{mode_name}/'+ 'train.csv', smiles_emb=smiles_emb, target_emb=target_emb, smiles_idx=smiles_idx, smiles_graph=smiles_graph, target_graph=target_graph, smiles_len=smiles_len, target_len=target_len,mode= mode_name)
+            val_dataset = DTA_Dataset(root='./', path=f'./{dataset_name}/{mode_name}/'+ 'valid.csv', smiles_emb=smiles_emb, target_emb=target_emb, smiles_idx=smiles_idx, smiles_graph=smiles_graph, target_graph=target_graph, smiles_len=smiles_len, target_len=target_len,mode= mode_name)
+            test_dataset = DTA_Dataset(root='./', path=f'./{dataset_name}/{mode_name}/'+ 'test.csv', smiles_emb=smiles_emb, target_emb=target_emb, smiles_idx=smiles_idx, smiles_graph=smiles_graph, target_graph=target_graph, smiles_len=smiles_len, target_len=target_len,mode= mode_name)
 
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -388,10 +496,9 @@ for fold in range(5):
             # r2 = r2_score(G, P)
             log(f'epoch {epoch} test mse:{mse}, r2:{rm2}, ci:{ci}')
             file_name = './Model/' + dataset_name + '_' + str(epoch) + '.pt'
-            if file_name is not None:
-                torch.save(model.state_dict(), file_name)
+            # if file_name is not None:
+            #     torch.save(model.state_dict(), file_name)
             print(f"epoch {epoch}:mse {mse} cindex {cindex} rm2 {rm2}")
-
     save_model = torch.load(model_file_name)
     model_dict = model.state_dict()
     state_dict = {k: v for k, v in save_model.items() if k in model_dict.keys()}
@@ -399,4 +506,5 @@ for fold in range(5):
     model.load_state_dict(model_dict)
     G, P = predicting(model, test_loader)
     cindex, rm2, mse = calculate_metrics_and_return(G, P, test_loader)
+    log(f'test mse:{mse}, r2:{rm2}, ci:{cindex}')
     break
