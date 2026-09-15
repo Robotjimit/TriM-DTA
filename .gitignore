@@ -21,3 +21,4 @@ target_contact_map_*/
 *.npy
 *.pdb
 *.sdf
+moe.py
